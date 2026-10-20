@@ -87,6 +87,33 @@ cargo publish -p soroban-testkit-cli
 gh release create v<version> --title "v<version>" --notes-file <(sed -n '/^## \[<version>\]/,/^## /p' CHANGELOG.md)
 ```
 
+## Verifying crate metadata locally
+
+Before pushing a tag, run the CLI's `release-verify` subcommand to check
+the same invariants the `Release` workflow enforces, without waiting for
+a CI run:
+
+```sh
+cargo run -p soroban-testkit-cli -- release-verify
+# or against a specific version (leading `v` is stripped):
+cargo run -p soroban-testkit-cli -- release-verify --version v0.1.0
+```
+
+The command checks, and reports together in one pass:
+
+- `[workspace.package] version` is set in the root `Cargo.toml`.
+- Both published crates (`crates/testkit`, `crates/cli`) inherit
+  `version`, `repository`, and `license` from the workspace, or declare
+  a literal `version` that matches the workspace version exactly.
+- `CHANGELOG.md` has a `## [<version>]` section.
+- `COMPATIBILITY.md` mentions the pinned `soroban-sdk` version.
+
+Every failure prints an actionable message naming the file and the fix.
+This is the CLI-native counterpart of
+[`.github/scripts/verify-release.sh`](.github/scripts/verify-release.sh);
+the shell script remains the source of truth the `Release` workflow
+runs at publish time.
+
 ## What the automated checks enforce
 
 The `Release` workflow enforces these release-critical invariants:

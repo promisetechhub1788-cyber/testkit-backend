@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -111,7 +111,7 @@ pub struct CoverageArgs {
     ///
     /// If no source files in the selected package are instrumented, coverage
     /// collection will report that no source files were covered.
-    #[arg(long, value_name = "PACKAGE")]
+    #[arg(long, visible_alias = "package", value_name = "PACKAGE")]
     include: Vec<String>,
     /// Collect coverage for the whole workspace except this package.
     /// Repeatable. Mutually exclusive with `--include`.
@@ -127,7 +127,23 @@ pub struct CoverageArgs {
     /// Write JSON to this path (defaults to coverage.json). Only valid with --format json.
     #[arg(long, value_name = "PATH")]
     output: Option<std::path::PathBuf>,
+    /// Leave generated and fixture code out of the report. Excludes files under
+    /// `generated/` or `fixtures/` directories and files named `*_generated.rs`.
+    /// Use `--ignore-filename-regex` for any other paths.
+    #[arg(long)]
+    exclude_generated: bool,
+    /// Leave source files whose path matches this regex out of the report.
+    /// Repeatable. Passed to `cargo llvm-cov --ignore-filename-regex`.
+    #[arg(long, value_name = "REGEX")]
+    ignore_filename_regex: Vec<String>,
+    /// Keep profile data from earlier runs instead of cleaning it first, so
+    /// repeated runs collect coverage incrementally (passes `--no-clean`).
+    #[arg(long)]
+    no_clean: bool,
 }
+
+/// Path regex matching generated and fixture code. Used by `--exclude-generated`.
+const GENERATED_AND_FIXTURE_IGNORE_REGEX: &str = r"(^|/)(generated|fixtures?)/|_generated\.rs$";
 
 /// Wraps `cargo llvm-cov test`, which handles Soroban's coverage needs
 /// correctly out of the box — soroban_sdk's own test harness runs contract
@@ -186,24 +202,44 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     prepare_output_destinations(&args)?;
     let mut cmd = build_command(&args)?;
 
-    let status = cmd.status().map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => CliError(
-            "cargo-llvm-cov is not installed or not found in PATH; \
-                     install it with: cargo install cargo-llvm-cov"
-                .to_string(),
-        ),
+    // Pipe stderr so we can inspect it for actionable diagnostics (e.g.
+    // missing Cargo.toml), while stdout is inherited so live progress output
+    // from cargo-llvm-cov reaches the terminal in real time.
+    cmd.stderr(Stdio::piped());
+
+    let child = cmd.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => CliError(identify_missing_coverage_dependency()),
         _ => CliError(format!(
             "failed to run `cargo llvm-cov` ({err}); is cargo-llvm-cov installed? \
                  try `cargo install cargo-llvm-cov`"
         )),
     })?;
 
-    if !status.success() {
-        return Err(CliError(coverage_failure_message(
-            status,
+    let output = child
+        .wait_with_output()
+        .map_err(|err| CliError(format!("failed to wait for `cargo llvm-cov`: {err}")))?;
+
+    let captured_stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Forward captured stderr to the terminal so the user sees cargo's output.
+    if !captured_stderr.is_empty() {
+        eprint!("{captured_stderr}");
+    }
+
+    if !output.status.success() {
+        let mut message = coverage_failure_message(
+            output.status,
             args.open,
             args.fail_under,
-        )));
+            &captured_stderr,
+        );
+        // Nothing is deleted on failure. Name any output files still on disk so
+        // the user can inspect them, and say they were not validated.
+        let kept = existing_artifacts(&args);
+        if !kept.is_empty() {
+            message.push_str(&preserved_artifacts_note(&kept));
+        }
+        return Err(CliError(message));
     }
 
     validate_coverage_outputs(&args)?;
@@ -213,6 +249,60 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// `lcov.info` path, inside `--output-dir` when given.
+fn lcov_output_path(args: &CoverageArgs) -> std::path::PathBuf {
+    args.output_dir
+        .as_ref()
+        .map_or_else(|| std::path::PathBuf::from("lcov.info"), |dir| dir.join("lcov.info"))
+}
+
+/// JSON report path: `--output`, else `coverage.json` inside `--output-dir`.
+fn json_output_path(args: &CoverageArgs) -> std::path::PathBuf {
+    args.output.clone().unwrap_or_else(|| {
+        args.output_dir
+            .as_ref()
+            .map(|dir| dir.join("coverage.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"))
+    })
+}
+
+/// Output files `args` asks cargo-llvm-cov to write. HTML reports go to
+/// `target/llvm-cov/html` when no `--output-dir` is given, cargo-llvm-cov's default.
+fn expected_artifacts(args: &CoverageArgs) -> Vec<std::path::PathBuf> {
+    match args.format {
+        Format::Text if !args.open => Vec::new(),
+        Format::Text | Format::Html => {
+            let dir = args
+                .output_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("target/llvm-cov/html"));
+            vec![dir.join("index.html")]
+        }
+        Format::Lcov => vec![lcov_output_path(args)],
+        Format::Json => vec![json_output_path(args)],
+    }
+}
+
+/// Expected output files that exist on disk right now.
+fn existing_artifacts(args: &CoverageArgs) -> Vec<std::path::PathBuf> {
+    expected_artifacts(args)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn preserved_artifacts_note(paths: &[std::path::PathBuf]) -> String {
+    let listed = paths
+        .iter()
+        .map(|path| format!("'{}'", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "; output files were left on disk and were not validated (they may be partial, \
+         or left over from an earlier run): {listed}"
+    )
 }
 
 /// Opens the generated HTML report in the system's default browser.
@@ -360,7 +450,7 @@ pub(crate) fn validate_coverage_outputs(args: &CoverageArgs) -> Result<(), CliEr
                 )));
             }
 
-            let (augmented, summary) = augment_coverage_json(&contents)?;
+            let (augmented, summary) = augment_coverage_json(&contents, &args.exclude)?;
             std::fs::write(&output_path, augmented).map_err(|err| {
                 CliError(format!(
                     "failed to write augmented coverage JSON output to '{}': {err}",
@@ -402,8 +492,20 @@ pub(crate) fn parse_lcov_coverage(contents: &str) -> Option<(usize, usize, f64)>
     }
 }
 
-/// Augments raw llvm-cov JSON export with stable `package_summaries`, `file_summaries`, and `summary` fields.
-pub fn augment_coverage_json(raw_json: &str) -> Result<(String, CoverageSummary), CliError> {
+/// Augments raw llvm-cov JSON export with stable `package_summaries`, `file_summaries`, and
+/// `summary` fields.
+///
+/// `excluded_packages` is the list of package names passed via `--exclude`. Files whose
+/// inferred package name appears in this list are omitted from all summaries so that
+/// excluded packages are never counted as uncovered lines — they were deliberately left
+/// out of instrumentation and must not skew the coverage percentage or `--fail-under`
+/// checks. Files with zero instrumentable lines (`lines_total == 0`) are also excluded
+/// from summaries for the same reason: they represent uninstrumented units, not uncovered
+/// ones.
+pub fn augment_coverage_json(
+    raw_json: &str,
+    excluded_packages: &[String],
+) -> Result<(String, CoverageSummary), CliError> {
     let mut root: serde_json::Value = serde_json::from_str(raw_json)
         .map_err(|err| CliError(format!("failed to parse coverage JSON output: {err}")))?;
 
@@ -430,14 +532,30 @@ pub fn augment_coverage_json(raw_json: &str) -> Result<(String, CoverageSummary)
                         .and_then(|l| l.get("covered"))
                         .and_then(|c| c.as_u64())
                         .unwrap_or(0) as usize;
-                    let line_percent = if lines_total > 0 {
-                        lines_summary
-                            .and_then(|l| l.get("percent"))
-                            .and_then(|p| p.as_f64())
-                            .unwrap_or_else(|| (lines_covered as f64 / lines_total as f64) * 100.0)
-                    } else {
-                        100.0
-                    };
+
+                    // Skip files with no instrumentable lines — they are not "uncovered",
+                    // they simply have nothing to measure (e.g. re-export-only modules,
+                    // proc-macro crates, or build scripts). Including them would inflate
+                    // `lines_total` with zeros while contributing nothing meaningful to
+                    // the coverage percentage.
+                    if lines_total == 0 {
+                        continue;
+                    }
+
+                    // Skip files that belong to explicitly excluded packages. cargo-llvm-cov
+                    // may still emit entries for packages that were excluded via --exclude
+                    // (e.g. because they were compiled as transitive dependencies). Counting
+                    // those entries as uncovered would produce a misleading percentage and
+                    // cause spurious --fail-under failures.
+                    let pkg = infer_package_name(&filename);
+                    if excluded_packages.iter().any(|ex| ex == &pkg) {
+                        continue;
+                    }
+
+                    let line_percent = lines_summary
+                        .and_then(|l| l.get("percent"))
+                        .and_then(|p| p.as_f64())
+                        .unwrap_or_else(|| (lines_covered as f64 / lines_total as f64) * 100.0);
 
                     total_covered += lines_covered;
                     total_lines += lines_total;
@@ -562,10 +680,44 @@ fn validate_html_output(output_dir: Option<&std::path::Path>) -> Result<(), CliE
     Ok(())
 }
 
+/// Returns true if the stderr output from cargo indicates a project metadata
+/// failure (missing or unreadable `Cargo.toml`, invalid manifest, workspace
+/// resolution error) rather than a coverage-specific failure.
+pub(crate) fn is_metadata_error(cargo_stderr: &str) -> bool {
+    // Patterns emitted by cargo when it cannot locate or parse project metadata.
+    const METADATA_PATTERNS: &[&str] = &[
+        "could not find `Cargo.toml`",
+        "could not find Cargo.toml",
+        "error: manifest path",
+        "failed to parse manifest",
+        "failed to read",
+        "no such file or directory",
+        "error reading",
+        "workspace manifest",
+        "current package believes it's in a workspace when it's not",
+    ];
+    let lower = cargo_stderr.to_ascii_lowercase();
+    METADATA_PATTERNS
+        .iter()
+        .any(|pat| lower.contains(&pat.to_ascii_lowercase()))
+}
+
+fn identify_missing_coverage_dependency() -> String {
+    format!(
+        "cargo-llvm-cov is not installed or not found in PATH.\n\
+         This tool requires two components:\n\
+         1. The cargo-llvm-cov binary: install with `cargo install cargo-llvm-cov`\n\
+         2. LLVM tools for your toolchain: install with `rustup component add llvm-tools-preview`\n\
+         If you have installed cargo-llvm-cov, check that it is in your PATH or the Rust toolchain directory.\n\
+         For more help, see: https://github.com/taiki-e/cargo-llvm-cov#installation"
+    )
+}
+
 fn coverage_failure_message(
     status: std::process::ExitStatus,
     open_requested: bool,
     fail_under: Option<f64>,
+    cargo_stderr: &str,
 ) -> String {
     #[cfg(unix)]
     {
@@ -574,6 +726,17 @@ fn coverage_failure_message(
         if let Some(signal) = status.signal() {
             return format!("coverage run terminated by signal {signal}");
         }
+    }
+
+    // Check for missing project metadata before any other heuristic — this is
+    // a setup problem, not a coverage problem, and deserves its own message.
+    if is_metadata_error(cargo_stderr) {
+        return format!(
+            "coverage run failed (cargo llvm-cov exited with {status}); \
+             cargo could not read project metadata — verify that a `Cargo.toml` \
+             exists in the current directory or a parent, and that the manifest is valid \
+             (`cargo metadata` can confirm this independently)"
+        );
     }
 
     if let Some(expected) = fail_under {
@@ -644,6 +807,24 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
     }
 
+    // Generated and fixture exclusions are folded into one regex, so the
+    // user's own patterns and the preset never conflict as separate flags.
+    let mut ignore_patterns: Vec<String> = args.ignore_filename_regex.clone();
+    if args.exclude_generated {
+        ignore_patterns.push(GENERATED_AND_FIXTURE_IGNORE_REGEX.to_string());
+    }
+    if !ignore_patterns.is_empty() {
+        let combined = ignore_patterns
+            .iter()
+            .map(|pattern| format!("(?:{pattern})"))
+            .collect::<Vec<_>>()
+            .join("|");
+        cmd.arg("--ignore-filename-regex").arg(combined);
+    }
+    if args.no_clean {
+        cmd.arg("--no-clean");
+    }
+
     match args.format {
         Format::Text => {
             if args.open {
@@ -655,12 +836,7 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
         Format::Lcov => {
             cmd.arg("--lcov");
-            let output_path = if let Some(dir) = &args.output_dir {
-                dir.join("lcov.info")
-            } else {
-                std::path::PathBuf::from("lcov.info")
-            };
-            cmd.arg("--output-path").arg(output_path);
+            cmd.arg("--output-path").arg(lcov_output_path(args));
         }
         Format::Html => {
             cmd.arg("--html");
@@ -670,13 +846,7 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
         Format::Json => {
             cmd.arg("--json");
-            let output_path = args.output.clone().unwrap_or_else(|| {
-                args.output_dir
-                    .as_ref()
-                    .map(|dir| dir.join("coverage.json"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"))
-            });
-            cmd.arg("--output-path").arg(output_path);
+            cmd.arg("--output-path").arg(json_output_path(args));
         }
     }
 
@@ -705,6 +875,9 @@ mod tests {
             exclude: exclude.iter().map(|s| s.to_string()).collect(),
             output_dir: None,
             output: None,
+            exclude_generated: false,
+            ignore_filename_regex: Vec::new(),
+            no_clean: false,
         }
     }
 
@@ -712,6 +885,106 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect()
+    }
+
+    #[test]
+    fn new_collection_flags_are_not_forwarded_by_default() {
+        let rendered = rendered_args(&build_command(&args(&[], &[])).unwrap());
+        assert!(!rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+        assert!(
+            !rendered.contains(&"--ignore-filename-regex".to_string()),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn no_clean_is_forwarded_to_cargo_llvm_cov() {
+        let mut a = args(&[], &[]);
+        a.no_clean = true;
+        let rendered = rendered_args(&build_command(&a).unwrap());
+        assert!(rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+    }
+
+    #[test]
+    fn exclude_generated_and_custom_patterns_share_one_ignore_regex() {
+        let mut a = args(&[], &[]);
+        a.exclude_generated = true;
+        a.ignore_filename_regex = vec!["vendor/".to_string()];
+        let rendered = rendered_args(&build_command(&a).unwrap());
+
+        let flags = rendered
+            .iter()
+            .filter(|arg| *arg == "--ignore-filename-regex")
+            .count();
+        assert_eq!(flags, 1, "{rendered:?}");
+        let position = rendered
+            .iter()
+            .position(|arg| arg == "--ignore-filename-regex")
+            .unwrap();
+        let pattern = &rendered[position + 1];
+        assert!(pattern.contains("(?:vendor/)"), "{pattern}");
+        assert!(pattern.contains("generated|fixtures?"), "{pattern}");
+        assert!(pattern.contains("_generated"), "{pattern}");
+    }
+
+    #[test]
+    fn custom_ignore_patterns_without_preset_are_forwarded_verbatim_in_order() {
+        let mut a = args(&[], &[]);
+        a.ignore_filename_regex = vec!["a/".to_string(), "b/".to_string()];
+        let rendered = rendered_args(&build_command(&a).unwrap());
+        let position = rendered
+            .iter()
+            .position(|arg| arg == "--ignore-filename-regex")
+            .unwrap();
+        assert_eq!(rendered[position + 1], "(?:a/)|(?:b/)");
+    }
+
+    #[test]
+    fn html_artifact_defaults_to_cargo_llvm_cov_report_dir() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Html;
+        assert_eq!(
+            expected_artifacts(&a),
+            vec![std::path::PathBuf::from("target/llvm-cov/html/index.html")]
+        );
+    }
+
+    #[test]
+    fn text_without_open_expects_no_artifacts() {
+        assert!(expected_artifacts(&args(&[], &[])).is_empty());
+    }
+
+    #[test]
+    fn failed_run_reports_kept_json_artifact_with_spaces_in_path() {
+        let dir = std::env::temp_dir().join(format!("stk cov kept {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("partial report.json");
+        std::fs::write(&json_path, "{}").unwrap();
+
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(json_path.clone());
+
+        let kept = existing_artifacts(&a);
+        assert_eq!(kept, vec![json_path.clone()]);
+        let note = preserved_artifacts_note(&kept);
+        assert!(
+            note.contains("were left on disk and were not validated"),
+            "{note}"
+        );
+        assert!(note.contains(&format!("'{}'", json_path.display())), "{note}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_run_reports_nothing_when_no_artifact_exists() {
+        let absent =
+            std::env::temp_dir().join(format!("stk-cov-absent-{}.json", std::process::id()));
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(absent);
+        assert!(existing_artifacts(&a).is_empty());
     }
 
     #[test]
@@ -807,12 +1080,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_path_with_spaces_in_name() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(std::path::PathBuf::from("my output file.json"));
+        let cmd = build_command(&a).unwrap();
+        let rendered = rendered_args(&cmd);
+        assert!(
+            rendered.contains(&"my output file.json".to_string()),
+            "path with spaces should be preserved: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn output_dir_with_spaces_in_json() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output_dir = Some(std::path::PathBuf::from("my coverage reports"));
+        let cmd = build_command(&a).unwrap();
+        let rendered = rendered_args(&cmd);
+        assert_eq!(
+            rendered,
+            vec![
+                "llvm-cov",
+                "test",
+                "--json",
+                "--output-path",
+                "my coverage reports/coverage.json",
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn signal_termination_is_reported_distinctly() {
         use std::os::unix::process::ExitStatusExt;
 
-        let message = coverage_failure_message(std::process::ExitStatus::from_raw(9), false, None);
+        let message =
+            coverage_failure_message(std::process::ExitStatus::from_raw(9), false, None, "");
         assert_eq!(message, "coverage run terminated by signal 9");
     }
 
@@ -1094,24 +1400,94 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         let status = std::process::ExitStatus::from_raw(256); // exit code 1
-        let msg_normal = coverage_failure_message(status, false, None);
+        let msg_normal = coverage_failure_message(status, false, None, "");
         assert!(
             msg_normal.contains("if no source files were instrumented"),
             "{msg_normal}"
         );
 
-        let msg_open = coverage_failure_message(status, true, None);
+        let msg_open = coverage_failure_message(status, true, None, "");
         assert!(
             msg_open.contains("HTML report was not generated so the browser will not be opened"),
             "{msg_open}"
         );
         assert!(!msg_open.contains("desktop browser opener"), "{msg_open}");
 
-        let msg_fail_under = coverage_failure_message(status, false, Some(85.5));
+        let msg_fail_under = coverage_failure_message(status, false, Some(85.5), "");
         assert!(
             msg_fail_under.contains("--fail-under threshold of 85.50%"),
             "{msg_fail_under}"
         );
+    }
+
+    #[test]
+    fn coverage_failure_message_distinguishes_missing_metadata_from_missing_tool() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(256); // exit code 1
+
+        // Metadata error: cargo cannot find Cargo.toml
+        let stderr_no_toml =
+            "error: could not find `Cargo.toml` in `/tmp/empty` or any parent directory";
+        let msg = coverage_failure_message(status, false, None, stderr_no_toml);
+        assert!(
+            msg.contains("cargo could not read project metadata"),
+            "expected metadata error message, got: {msg}"
+        );
+        assert!(
+            msg.contains("Cargo.toml"),
+            "message should mention Cargo.toml: {msg}"
+        );
+        assert!(
+            msg.contains("cargo metadata"),
+            "message should suggest cargo metadata: {msg}"
+        );
+        // Must NOT suggest instrumentation/filter issues for a metadata problem
+        assert!(
+            !msg.contains("no source files were instrumented"),
+            "metadata error should not suggest instrumentation issues: {msg}"
+        );
+
+        // Metadata error: invalid manifest
+        let stderr_bad_manifest =
+            "error: failed to parse manifest at `/home/user/project/Cargo.toml`";
+        let msg2 = coverage_failure_message(status, false, None, stderr_bad_manifest);
+        assert!(
+            msg2.contains("cargo could not read project metadata"),
+            "failed to parse manifest should be treated as metadata error: {msg2}"
+        );
+
+        // Non-metadata error: generic coverage failure
+        let stderr_generic = "error: some llvm error occurred";
+        let msg3 = coverage_failure_message(status, false, None, stderr_generic);
+        assert!(
+            msg3.contains("if no source files were instrumented"),
+            "non-metadata error should use generic message: {msg3}"
+        );
+        assert!(
+            !msg3.contains("cargo could not read project metadata"),
+            "non-metadata error must not claim metadata problem: {msg3}"
+        );
+    }
+
+    #[test]
+    fn is_metadata_error_detects_known_cargo_patterns() {
+        assert!(is_metadata_error(
+            "error: could not find `Cargo.toml` in `/tmp`"
+        ));
+        assert!(is_metadata_error("error: could not find Cargo.toml"));
+        assert!(is_metadata_error(
+            "error: manifest path `/bad` does not exist"
+        ));
+        assert!(is_metadata_error(
+            "error: failed to parse manifest at `/project/Cargo.toml`"
+        ));
+        assert!(!is_metadata_error(
+            "error: some llvm-cov instrumentation failure"
+        ));
+        assert!(!is_metadata_error("error: failed to compile test binary"));
+        assert!(!is_metadata_error(""));
     }
 
     #[test]
@@ -1186,7 +1562,7 @@ mod tests {
             ]
         }"#;
 
-        let (augmented, summary) = augment_coverage_json(raw_json).unwrap();
+        let (augmented, summary) = augment_coverage_json(raw_json, &[]).unwrap();
         assert_eq!(summary.lines_total, 350);
         assert_eq!(summary.lines_covered, 280);
         assert!((summary.line_percent - 80.0).abs() < 1e-4);
@@ -1205,6 +1581,170 @@ mod tests {
         assert_eq!(files[0]["lines_covered"], 85);
         assert_eq!(files[0]["lines_total"], 100);
         assert_eq!(files[0]["line_percent"], 85.0);
+    }
+
+    // ── Bug #461 regression: excluded files must not be treated as uncovered ──
+
+    #[test]
+    fn augment_coverage_json_skips_zero_line_files_from_summary() {
+        // Files with lines_total == 0 (e.g. re-export modules, proc-macro crates,
+        // build scripts) must not inflate lines_total or drag down line_percent.
+        let raw_json = r#"{
+            "data": [{
+                "files": [
+                    {
+                        "filename": "crates/testkit/src/lib.rs",
+                        "summary": { "lines": { "count": 100, "covered": 80, "percent": 80.0 } }
+                    },
+                    {
+                        "filename": "crates/testkit/src/reexport.rs",
+                        "summary": { "lines": { "count": 0, "covered": 0, "percent": 0.0 } }
+                    }
+                ]
+            }]
+        }"#;
+
+        let (augmented, summary) = augment_coverage_json(raw_json, &[]).unwrap();
+
+        // Zero-line file must not appear in file_summaries or package_summaries.
+        let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        let files = parsed["file_summaries"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "zero-line file must be excluded from file_summaries"
+        );
+        assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
+
+        // Totals must only reflect the one instrumented file.
+        assert_eq!(summary.lines_total, 100);
+        assert_eq!(summary.lines_covered, 80);
+        assert!((summary.line_percent - 80.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn augment_coverage_json_excluded_packages_not_counted_as_uncovered() {
+        // When --exclude cli is passed, files from the cli package that appear in
+        // the JSON (because cargo compiled them as dependencies) must not be counted
+        // as uncovered lines, even if their covered count is zero.
+        let raw_json = r#"{
+            "data": [{
+                "files": [
+                    {
+                        "filename": "crates/testkit/src/lib.rs",
+                        "summary": { "lines": { "count": 100, "covered": 80, "percent": 80.0 } }
+                    },
+                    {
+                        "filename": "crates/cli/src/main.rs",
+                        "summary": { "lines": { "count": 200, "covered": 0, "percent": 0.0 } }
+                    }
+                ]
+            }]
+        }"#;
+
+        // Without exclusion: cli's 200 uncovered lines drag the percentage down.
+        let (_, summary_all) = augment_coverage_json(raw_json, &[]).unwrap();
+        assert_eq!(summary_all.lines_total, 300);
+        assert_eq!(summary_all.lines_covered, 80);
+        assert!((summary_all.line_percent - (80.0 / 300.0 * 100.0)).abs() < 1e-4);
+
+        // With --exclude cli: only testkit lines are counted.
+        let (augmented, summary_excl) =
+            augment_coverage_json(raw_json, &["cli".to_string()]).unwrap();
+        assert_eq!(
+            summary_excl.lines_total, 100,
+            "excluded package lines must not inflate total"
+        );
+        assert_eq!(summary_excl.lines_covered, 80);
+        assert!(
+            (summary_excl.line_percent - 80.0).abs() < 1e-4,
+            "excluded package must not reduce line_percent: {}",
+            summary_excl.line_percent
+        );
+
+        // Excluded file must not appear in file_summaries.
+        let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        let files = parsed["file_summaries"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "excluded package file must be absent from file_summaries"
+        );
+        assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
+
+        let pkgs = parsed["package_summaries"].as_array().unwrap();
+        assert_eq!(
+            pkgs.len(),
+            1,
+            "excluded package must be absent from package_summaries"
+        );
+        assert_eq!(pkgs[0]["package_name"], "testkit");
+    }
+
+    #[test]
+    fn augment_coverage_json_multiple_excluded_packages() {
+        let raw_json = r#"{
+            "data": [{
+                "files": [
+                    {
+                        "filename": "crates/testkit/src/lib.rs",
+                        "summary": { "lines": { "count": 100, "covered": 90, "percent": 90.0 } }
+                    },
+                    {
+                        "filename": "crates/cli/src/main.rs",
+                        "summary": { "lines": { "count": 50, "covered": 0, "percent": 0.0 } }
+                    },
+                    {
+                        "filename": "crates/audit/src/lib.rs",
+                        "summary": { "lines": { "count": 80, "covered": 0, "percent": 0.0 } }
+                    }
+                ]
+            }]
+        }"#;
+
+        let (_, summary) =
+            augment_coverage_json(raw_json, &["cli".to_string(), "audit".to_string()]).unwrap();
+
+        assert_eq!(summary.lines_total, 100);
+        assert_eq!(summary.lines_covered, 90);
+        assert!((summary.line_percent - 90.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn augment_coverage_json_excluded_and_zero_line_combined() {
+        // Both exclusions apply independently: zero-line files are always dropped,
+        // named excluded packages are always dropped, regardless of order.
+        let raw_json = r#"{
+            "data": [{
+                "files": [
+                    {
+                        "filename": "crates/testkit/src/lib.rs",
+                        "summary": { "lines": { "count": 100, "covered": 75, "percent": 75.0 } }
+                    },
+                    {
+                        "filename": "crates/cli/src/mod.rs",
+                        "summary": { "lines": { "count": 0, "covered": 0, "percent": 0.0 } }
+                    },
+                    {
+                        "filename": "crates/audit/src/lib.rs",
+                        "summary": { "lines": { "count": 60, "covered": 0, "percent": 0.0 } }
+                    }
+                ]
+            }]
+        }"#;
+
+        let (augmented, summary) = augment_coverage_json(raw_json, &["audit".to_string()]).unwrap();
+
+        // Only testkit/lib.rs survives: cli/mod.rs is dropped (zero lines),
+        // audit/lib.rs is dropped (excluded package).
+        assert_eq!(summary.lines_total, 100);
+        assert_eq!(summary.lines_covered, 75);
+        assert!((summary.line_percent - 75.0).abs() < 1e-4);
+
+        let parsed: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        let files = parsed["file_summaries"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["filename"], "crates/testkit/src/lib.rs");
     }
 
     #[test]

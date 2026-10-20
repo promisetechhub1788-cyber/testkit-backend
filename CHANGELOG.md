@@ -30,6 +30,9 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- Coverage accepts repeatable `--include`/`--package` and `--exclude` flags
+  to select workspace packages for targeted runs.
+
 - Core test environment: `TestEnv` with deterministic seeding
   (`with_seed`), random address generation, and a `TestkitError` type that
   every assertion helper panics with.
@@ -78,9 +81,19 @@ section, so a merge can never land without a place to record the change.
 - `AuthMatrix::known_actors` exposes the de-duplicated union of every entry
   point's `allowed` addresses, making explicit which callers the matrix
   cross-checks.
+- `soroban-testkit coverage` gains `--exclude-generated` (leaves out
+  `generated/` and `fixtures/` directories and `*_generated.rs` files),
+  `--ignore-filename-regex <REGEX>` for any other paths (repeatable), and
+  `--no-clean` to keep profile data between runs for incremental collection.
+- `soroban-testkit limits` gains an opt-in `--jobs <N>` (1 to 8, default 1)
+  that probes up to N ramp values concurrently while doubling to the first
+  failure. Results are read back in ramp order, so the reported boundary is
+  the same as a sequential run. Binary refinement stays sequential.
 
 ### Changed
 
+- A failed `soroban-testkit coverage` run now names any output files still on
+  disk and states that they were not validated. Nothing is deleted on failure.
 - `AuthMatrix` failure reports now state the definition of a "known actor",
   and event-capture failure diagnostics render the captured topics and data
   in decoded form so they line up with the raw captured values. The signed
@@ -89,9 +102,41 @@ section, so a merge can never land without a place to record the change.
 - The `limits` subcommand now mocks authorization on each isolated probe
   and defaults numeric ramp parameters to a non-zero value, making it
   usable against real auth-gated payout contracts out of the box.
+- `AuthMatrix` docs now state that repeated callers are de-duplicated and
+  that entry-point names may be reused to check one function under several
+  setups, each producing its own reported section.
+- `soroban_testkit::tokens` docs now name the unit (whole units vs base
+  units/stroops) on every method and state that the SAC admin's authorization
+  is mocked for `mint`/`mint_raw` only, not for other operations.
+- `soroban_testkit::ttl` docs now spell out per-storage-kind behavior against
+  the pinned SDK: temporary entries are deleted on expiry, while persistent
+  and instance entries are archived and restored on next read.
 
 ### Fixed
 
+- Exclude `vendor/` alongside `target/` from recursive `audit` scans while
+  honoring explicitly selected scan roots (#427).
+- Apply audit rules consistently to raw Rust identifiers, including types,
+  bindings, and method names (#434).
+- Guard empty-source audit behavior across file, directory, and stdin scans
+  in every output format (#435).
+- Explain how to recover from a `limits --ramp` name missing from the selected
+  function's ABI, including functions with no inputs; guard rejection before
+  probes or report writes (#441).
+- Validate the `limits` success/failure bracket before binary refinement and
+  report unstable probe results with recovery guidance (#442).
+- Clamp doubled ramp values to the search cap without integer overflow (#443).
+- Rebuild the limits test fixture before use and reject failed rebuilds even
+  when an older WASM artifact exists (#449).
+- Explain how to recover from a missing or unreadable `--contract` file (#450).
+- Keep `audit` findings and baseline paths relative to the workspace, and
+  discover rule configuration consistently for directories, files, and stdin
+  (#428). Continue scanning readable files after source or traversal errors,
+  while returning a non-zero status for incomplete scans (#425). Distinguish
+  Rust, TOML, and JSON parse diagnostics from file-access errors and include
+  the affected path and available source location (#426). Guard JSON escaping
+  of control characters in paths and diagnostic fields with regression
+  coverage (#424).
 - `TestEnv::at` now enters its scope with a coherent ledger position: the
   sequence number is derived from the scoped timestamp and the environment's
   ledger close interval (saturating at the ends of the range) instead of

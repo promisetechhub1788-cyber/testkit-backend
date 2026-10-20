@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::panic;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use clap::Args;
@@ -30,6 +30,10 @@ pub const MEASUREMENT_LIMITATIONS: &str =
 /// rather than ramping forever.
 pub const SEARCH_UPPER_BOUND: u32 = 1 << 24;
 
+/// Largest accepted `--jobs`. Each concurrent probe is a full child process,
+/// so the bound keeps memory and CPU use predictable.
+const MAX_PROBE_JOBS: usize = 8;
+
 /// The standardized reason a single probe did not succeed.
 ///
 /// Every failure category is reported verbatim in the human-readable summary,
@@ -44,6 +48,8 @@ pub enum ProbeFailureCategory {
     /// either rejected the ramp value with its own validation error or
     /// exhausted a host resource budget.
     ExitFailure,
+    /// A contract rejected or trapped before exhausting a resource budget.
+    ContractFailure,
     /// The probe exceeded `--probe-timeout` and was killed by the parent
     /// before it could finish.
     TimedOut,
@@ -62,6 +68,7 @@ impl ProbeFailureCategory {
     pub fn label(self) -> &'static str {
         match self {
             ProbeFailureCategory::ExitFailure => "exit-failure",
+            ProbeFailureCategory::ContractFailure => "contract-failure",
             ProbeFailureCategory::TimedOut => "timed-out",
             ProbeFailureCategory::Abort => "abort",
             ProbeFailureCategory::SpawnFailure => "spawn-failure",
@@ -73,7 +80,10 @@ impl ProbeFailureCategory {
     pub fn guidance(self) -> &'static str {
         match self {
             ProbeFailureCategory::ExitFailure => {
-                "the contract rejected this value or exhausted a resource budget; this is the normal ceiling signal"
+                "the probe exited non-zero; check its stderr to distinguish rejection from exhaustion"
+            }
+            ProbeFailureCategory::ContractFailure => {
+                "the contract rejected or trapped at this value before any verified resource ceiling; inspect the contract logic"
             }
             ProbeFailureCategory::TimedOut => {
                 "raise --probe-timeout to confirm whether the ceiling reflects a hang or a real resource limit"
@@ -110,6 +120,19 @@ impl ProbeOutcome {
     }
 }
 
+/// Probe child errors have a stable marker only when the SDK reported a
+/// non-budget invocation error. Generic non-zero exits remain ambiguous.
+fn classify_probe_exit_stderr(stderr: &str) -> ProbeFailureCategory {
+    if stderr
+        .lines()
+        .any(|line| line.starts_with("error: contract-failure:"))
+    {
+        ProbeFailureCategory::ContractFailure
+    } else {
+        ProbeFailureCategory::ExitFailure
+    }
+}
+
 /// `serde(skip_serializing_if)` helper: omitted for an empty failure map.
 fn map_is_empty<K, V>(map: &BTreeMap<K, V>) -> bool {
     map.is_empty()
@@ -139,6 +162,10 @@ pub struct LimitsSummary {
     /// Why that first failure happened, standardized for every report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_failure_category: Option<ProbeFailureCategory>,
+    /// Stderr captured from the first failing probe, providing
+    /// actionable context for why the ceiling was hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_failed_probe_stderr: Option<String>,
     /// How many probes failed in each category over the whole run.
     #[serde(skip_serializing_if = "map_is_empty")]
     pub probe_failure_counts: BTreeMap<ProbeFailureCategory, usize>,
@@ -183,6 +210,12 @@ impl LimitsSummary {
                 .join(", ");
             out.push_str(&format!("  probe failures: {counts}\n"));
         }
+        if let Some(stderr) = &self.first_failed_probe_stderr {
+            let trimmed = stderr.trim();
+            if !trimmed.is_empty() {
+                out.push_str(&format!("  first failing probe stderr: {trimmed}\n"));
+            }
+        }
         if let Some(audit) = &self.audit {
             out.push_str(&format!(
                 "  boundary refinement: probed {} values between {} and {} (final boundary: [{}, {}])\n",
@@ -196,6 +229,15 @@ impl LimitsSummary {
         out.push_str(&format!("  ({})\n", self.measurement_limitations));
         if let Some(repro) = &self.reproduction {
             out.push_str(&format!("  reproduce locally: {repro}\n"));
+        }
+        if self
+            .probe_failure_counts
+            .contains_key(&ProbeFailureCategory::Abort)
+        {
+            out.push_str(
+                "  note: a host abort may reflect a contract trap rather than a resource limit; \
+                 inspect the function and re-run to confirm\n",
+            );
         }
         if self.hit_upper_bound {
             out.push_str(&format!(
@@ -245,13 +287,15 @@ pub struct RefinementAudit {
 /// Arguments for `soroban-testkit limits`.
 #[derive(Args)]
 pub struct LimitsArgs {
-    /// Path to the compiled contract .wasm file.
+    /// Path to an existing compiled contract .wasm file. Build successfully before
+    /// running limits; this command does not rebuild contracts.
     #[arg(long, value_name = "PATH")]
     contract: std::path::PathBuf,
     /// The contract function to ramp.
     #[arg(long = "fn", value_name = "NAME")]
     function: String,
-    /// The parameter to increase on each attempt.
+    /// The parameter to increase on each attempt. Must exactly match an input
+    /// name in the selected function's contract ABI; checked before probing.
     #[arg(long, value_name = "PARAM")]
     ramp: String,
     /// Explicit value for a non-ramped parameter, as NAME=VALUE. Repeatable.
@@ -264,6 +308,14 @@ pub struct LimitsArgs {
     /// infinite wait.
     #[arg(long, value_name = "SECONDS", default_value_t = 30)]
     probe_timeout: u64,
+    /// Probe up to this many ramp values at once while doubling to find the
+    /// first failing value (1 to 8, default 1 = sequential). Results are read
+    /// back in ramp order, so the reported boundary does not depend on which
+    /// probe finishes first. Binary refinement between the bounds always runs
+    /// one probe at a time. Probes past the first failure still run to completion
+    /// but are discarded, so extra work is bounded by `--jobs - 1` probes.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    jobs: usize,
     /// Compare this run's result against a baseline previously written by
     /// `--save-baseline`. Exits non-zero if the discovered ceiling
     /// regressed (a lower ramp value, or higher instructions/memory) by
@@ -330,9 +382,9 @@ pub struct ProbeArgs {
 /// 2. **Spawn one child per probe.** The parent re-executes itself as
 ///    `soroban-testkit __limits-probe` (hidden from `--help`) with the
 ///    ramp value passed through `--value`. See [`run_probe`] for the child
-///    half. The child's `Env` is a throwaway registered from the `.wasm`
-///    and is dropped when the child exits, so no state leaks between
-///    probes.
+///    half. The command creates no temporary Cargo projects and launches
+///    no shell; the child's in-memory `Env` is disposable. `ProbeChild`
+///    kills and reaps on ordinary interruption, error and early return.
 /// 3. **Bound the probe.** The parent waits up to `--probe-timeout` in
 ///    [`wait_with_timeout`]. If the child finishes, its exit status decides
 ///    the outcome; if it overruns, the parent kills it and records a
@@ -372,6 +424,12 @@ pub struct ProbeArgs {
 /// the host's budget, are reported.
 pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     validate_percentage("--baseline-tolerance-pct", args.baseline_tolerance_pct)?;
+    if args.jobs == 0 || args.jobs > MAX_PROBE_JOBS {
+        return Err(CliError(format!(
+            "--jobs must be between 1 and {MAX_PROBE_JOBS} (got {})",
+            args.jobs
+        )));
+    }
 
     // Validate the configuration (function exists, ramp parameter exists,
     // every parameter's type is one this command knows how to default or
@@ -391,78 +449,61 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     let mut probe_failure_counts: BTreeMap<ProbeFailureCategory, usize> = BTreeMap::new();
     let mut last_failed_probe: Option<u32> = None;
     let mut last_failure_category: Option<ProbeFailureCategory> = None;
+    let mut first_failed_probe_stderr: Option<String> = None;
     let mut hit_upper_bound = false;
 
-    let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
-        let mut child = Command::new(&self_exe)
-            .arg("__limits-probe")
-            .arg("--contract")
-            .arg(&args.contract)
-            .arg("--fn")
-            .arg(&args.function)
-            .arg("--ramp")
-            .arg(&args.ramp)
-            .arg("--value")
-            .arg(value.to_string())
-            .args(
-                args.arg_values
-                    .iter()
-                    .flat_map(|value| ["--arg", value.as_str()]),
-            )
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|err| {
-                CliError(format!(
-                    "failed to spawn the isolated probe process for ramp value {value}: {err}; \
-                     verify the soroban-testkit binary is intact and re-run \
-                     ({})",
-                    ProbeFailureCategory::SpawnFailure.guidance()
-                ))
-            })?;
-
-        let outcome = match wait_with_timeout(&mut child, probe_timeout)? {
-            Some(status) if status.success() => ProbeOutcome::Succeeded,
-            // A signal-terminated child has no exit code; that is the host
-            // abort this command exists to survive, not a normal rejection.
-            Some(status) if status.code().is_none() => {
-                ProbeOutcome::Failed(ProbeFailureCategory::Abort)
-            }
-            Some(_) => ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure),
-            None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
-        };
+    // Folds one probe result into the run's statistics. Only called in ramp
+    // order, so the counts and the first failure's stderr match a sequential run.
+    let mut record = |value: u32, outcome: ProbeOutcome, stderr: String| {
         if let ProbeOutcome::Failed(category) = outcome {
+            // A contract failure cannot establish a budget ceiling, even if
+            // earlier, lower ramp values succeeded.
+            if category == ProbeFailureCategory::ContractFailure {
+                return Err(CliError(format!(
+                    "contract function {:?} failed at {}={} before a resource limit was verified; \
+                     check the contract's validation and trap logic; probe stderr: {}",
+                    args.function,
+                    args.ramp,
+                    value,
+                    stderr.trim()
+                )));
+            }
             *probe_failure_counts.entry(category).or_insert(0) += 1;
+            if first_failed_probe_stderr.is_none() && !stderr.trim().is_empty() {
+                first_failed_probe_stderr = Some(stderr);
+            }
         }
         Ok(outcome)
     };
 
-    // Find a failing upper bound by doubling.
+    // Find a failing upper bound by doubling. Each batch holds up to `jobs`
+    // consecutive ladder values probed concurrently; results are read back in
+    // ladder order and reading stops at the first failure, so the outcome is
+    // the same as a sequential run.
     let mut last_ok: Option<u32> = None;
-    let mut low = 1u32;
     let mut high = None;
-    loop {
-        match probe(low)? {
-            ProbeOutcome::Succeeded => {
-                last_ok = Some(low);
-                match low.checked_mul(2) {
-                    Some(next) => low = next,
-                    None => {
-                        high = None;
-                        break;
+    let mut next = Some(1u32);
+    while let Some(start) = next {
+        let batch = ladder_batch(start, SEARCH_UPPER_BOUND, args.jobs);
+        let results = probe_batch(&self_exe, &args, &batch, probe_timeout);
+        for (value, result) in batch.into_iter().zip(results) {
+            let (outcome, stderr) = result?;
+            match record(value, outcome, stderr)? {
+                ProbeOutcome::Succeeded => {
+                    last_ok = Some(value);
+                    next = next_ramp_value(value, SEARCH_UPPER_BOUND);
+                    if next.is_none() {
+                        hit_upper_bound = true;
                     }
                 }
+                ProbeOutcome::Failed(category) => {
+                    last_failed_probe = Some(value);
+                    last_failure_category = Some(category);
+                    high = Some(value);
+                    next = None;
+                    break;
+                }
             }
-            ProbeOutcome::Failed(category) => {
-                last_failed_probe = Some(low);
-                last_failure_category = Some(category);
-                high = Some(low);
-                break;
-            }
-        }
-        if low > SEARCH_UPPER_BOUND {
-            hit_upper_bound = true;
-            break;
         }
     }
 
@@ -474,8 +515,15 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             ),
             None => String::new(),
         };
+        let stderr_note = first_failed_probe_stderr
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("; probe stderr: {s}"))
+            .unwrap_or_default();
         return Err(CliError(format!(
-            "{:?} failed even at the smallest ramp value (1) for parameter {:?}{category_note}; \
+            "{:?} failed even at the smallest ramp value (1) for parameter {:?}{category_note}\
+             {stderr_note}; \
              this usually indicates a validation error in the contract rather than a \
              resource limit — check the contract's parameter validation logic and retry",
             args.function, args.ramp
@@ -483,12 +531,18 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     };
 
     // Binary search between the last success and the first failure for a
-    // tighter bound, if we found one.
+    // tighter bound, if we found one. Use the last failing probe value to
+    // ensure we have a deterministic stopping condition.
     let mut best = last_ok;
     let mut first_failed = last_failed_probe;
     let mut first_failure_category = last_failure_category;
     let mut refinement_audit = None;
     if let Some(hi_start) = high {
+        // Refinement is sequential: each midpoint depends on the previous result.
+        let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
+            let (outcome, stderr) = spawn_probe(&self_exe, &args, value, probe_timeout)?;
+            record(value, outcome, stderr)
+        };
         let (last_success, first_failure, audit) =
             refine_upper_bound_audited(last_ok, hi_start, &mut probe)?;
         best = last_success;
@@ -527,6 +581,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         memory_bytes,
         first_failed,
         first_failure_category,
+        first_failed_probe_stderr,
         probe_failure_counts,
         hit_upper_bound,
         probe_timeout_secs: args.probe_timeout,
@@ -567,7 +622,126 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Builds actionable guidance explaining how to reproduce the discovered ceiling locally.
+/// Runs one probe in its own process and returns its classified outcome with
+/// the captured stderr. It touches no shared state, so calls may run concurrently.
+fn spawn_probe(
+    self_exe: &Path,
+    args: &LimitsArgs,
+    value: u32,
+    probe_timeout: Duration,
+) -> Result<(ProbeOutcome, String), CliError> {
+    let child = Command::new(self_exe)
+        .arg("__limits-probe")
+        .arg("--contract")
+        .arg(&args.contract)
+        .arg("--fn")
+        .arg(&args.function)
+        .arg("--ramp")
+        .arg(&args.ramp)
+        .arg("--value")
+        .arg(value.to_string())
+        .args(
+            args.arg_values
+                .iter()
+                .flat_map(|value| ["--arg", value.as_str()]),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            CliError(format!(
+                "failed to spawn the isolated probe process for ramp value {value}: {err}; \
+                 verify the soroban-testkit binary is intact and re-run \
+                 ({})",
+                ProbeFailureCategory::SpawnFailure.guidance()
+            ))
+        })?;
+    // Retain upstream's RAII cleanup on early returns and failures.
+    let mut child = ProbeChild { child };
+
+    let status = wait_with_timeout(&mut child.child, probe_timeout)?;
+    let stderr = child
+        .child
+        .stderr
+        .take()
+        .map_or(Ok(String::new()), |mut stream| {
+            use std::io::Read;
+            let mut buffer = String::new();
+            stream.read_to_string(&mut buffer).map(|_| buffer)
+        })
+        .map_err(|err| CliError(format!("failed to read probe stderr: {err}")))?;
+
+    let outcome = match status {
+        Some(status) if status.success() => ProbeOutcome::Succeeded,
+        Some(status) if status.code().is_none() => {
+            ProbeOutcome::Failed(ProbeFailureCategory::Abort)
+        }
+        Some(_) => ProbeOutcome::Failed(classify_probe_exit_stderr(&stderr)),
+        None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
+    };
+    Ok((outcome, stderr))
+}
+
+/// Runs `values` as concurrent probes, one thread each, and returns the results
+/// in the same order as `values`.
+fn probe_batch(
+    self_exe: &Path,
+    args: &LimitsArgs,
+    values: &[u32],
+    probe_timeout: Duration,
+) -> Vec<Result<(ProbeOutcome, String), CliError>> {
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = values
+            .iter()
+            .map(|&value| scope.spawn(move || spawn_probe(self_exe, args, value, probe_timeout)))
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    Err(CliError(
+                        "an isolated probe worker panicked; re-run with --jobs 1 to isolate \
+                         the failing probe"
+                            .to_string(),
+                    ))
+                })
+            })
+            .collect()
+    })
+}
+
+/// The next ramp values of the doubling ladder from `start`: at most `jobs`
+/// values, each the successor of the one before, stopping at `upper_bound`.
+fn ladder_batch(start: u32, upper_bound: u32, jobs: usize) -> Vec<u32> {
+    let jobs = jobs.max(1);
+    let mut batch = Vec::with_capacity(jobs);
+    let mut current = Some(start);
+    while let Some(value) = current {
+        if batch.len() == jobs {
+            break;
+        }
+        batch.push(value);
+        current = next_ramp_value(value, upper_bound);
+    }
+    batch
+}
+
+/// Shell-quote a single argument for copyable POSIX-shell guidance.
+/// Actual probes use Command::arg directly and never launch a shell or Cargo.
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:=+".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Builds shell-safe instructions for reproducing the discovered ceiling.
+/// Spaces and single quotes in the WASM path remain one argument.
 pub fn build_reproduction_guidance(
     contract: &str,
     function: &str,
@@ -575,10 +749,14 @@ pub fn build_reproduction_guidance(
     best: u32,
     arg_values: &[String],
 ) -> String {
-    let mut cmd =
-        format!("soroban-testkit limits --contract {contract} --fn {function} --ramp {ramp}");
+    let mut cmd = format!(
+        "soroban-testkit limits --contract {} --fn {} --ramp {}",
+        shell_quote(contract),
+        shell_quote(function),
+        shell_quote(ramp)
+    );
     for arg in arg_values {
-        cmd.push_str(&format!(" --arg {arg}"));
+        cmd.push_str(&format!(" --arg {}", shell_quote(arg)));
     }
     format!(
         "invoke `{function}` with `{ramp}` = {best} in a test environment; to re-verify the boundary via CLI run: `{cmd}`"
@@ -594,9 +772,21 @@ fn validate_percentage(name: &str, pct: f64) -> Result<(), CliError> {
     Ok(())
 }
 
+// Stop at the cap and clamp the last step, including when doubling would overflow.
+fn next_ramp_value(current: u32, upper_bound: u32) -> Option<u32> {
+    if current >= upper_bound {
+        None
+    } else {
+        Some(current.saturating_mul(2).min(upper_bound))
+    }
+}
+
 /// Refines the boundary between a known success (`low`) and a known failure (`high`)
 /// using binary search, recording every intermediate step in a [`RefinementAudit`]
 /// — including the standardized [`ProbeFailureCategory`] of each failing step.
+/// Re-probes both endpoints before refinement and rejects a contradictory bracket.
+/// The contract must succeed monotonically up to its ceiling: these checks detect
+/// observed inconsistencies, but cannot prove monotonicity at unprobed values.
 pub fn refine_upper_bound_audited<F>(
     mut low: u32,
     mut high: u32,
@@ -608,6 +798,21 @@ where
     if low >= high {
         return Err(CliError(format!(
             "refine_upper_bound requires lower bound ({low}) < upper bound ({high})"
+        )));
+    }
+
+    if !probe(low)?.succeeded() {
+        return Err(CliError(format!(
+            "non-monotonic probe results: lower bound {low} no longer succeeds; \
+             binary refinement requires a stable successful lower bound and failing upper bound; \
+             check contract validation and probe timeouts, then re-run"
+        )));
+    }
+    if probe(high)?.succeeded() {
+        return Err(CliError(format!(
+            "non-monotonic probe results: upper bound {high} now succeeds; \
+             binary refinement requires a stable successful lower bound and failing upper bound; \
+             check contract validation and probe timeouts, then re-run"
         )));
     }
 
@@ -687,40 +892,78 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
         load(&args.contract, &args.function, &args.ramp)?;
     let args_vec = build_args(&env, &function, ramp_index, args.value, &args.arg_values)?;
     let func = Symbol::new(&env, &args.function);
-    if invoke_succeeds(&env, &contract_id, &func, args_vec) {
-        Ok(())
-    } else {
-        Err(CliError("probe failed".to_string()))
+    match env.try_invoke_contract::<Val, soroban_sdk::Error>(&contract_id, &func, args_vec) {
+        Ok(Ok(_)) => Ok(()),
+        Err(Ok(err)) if !err.is_type(soroban_sdk::xdr::ScErrorType::Budget) => Err(CliError(
+            format!("contract-failure: invocation returned {err:?}"),
+        )),
+        _ => Err(CliError("probe failed".to_string())),
     }
 }
 
-/// Waits up to `timeout` for `child` to exit, polling rather than blocking
-/// so an exceeded timeout can kill it instead of waiting forever. Returns
-/// `Some(status)` on a normal exit within the timeout, or `None` if the
-/// child was killed for running too long — which the caller classifies as
-/// [`ProbeFailureCategory::TimedOut`]. A status with no exit code means the
-/// child was terminated by a signal ([`ProbeFailureCategory::Abort`]).
-/// Killing and reaping here is what guarantees a timed-out probe's
-/// temporary environment does not outlive the probe.
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<Option<std::process::ExitStatus>, CliError> {
-    let deadline = Instant::now() + timeout;
+/// Owns one isolated probe. On ordinary error, early return or unwinding,
+/// terminate and reap any child still running. No temporary Cargo project or
+/// source directory is created by this command. An uncatchable OS termination
+/// of the parent cannot invoke Drop.
+struct ProbeChild {
+    child: Child,
+}
+
+impl Drop for ProbeChild {
+    fn drop(&mut self) {
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Poll one child until it exits or exceeds its deadline. A timeout kills
+/// and reaps before returning None. Errors name the process rather than
+/// silently claiming a resource ceiling. ProbeChild handles early errors.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>, CliError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| CliError("probe timeout is too large for the host clock".to_string()))?;
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|err| CliError(format!("failed to poll probe: {err}")))?
-        {
+        if let Some(status) = child.try_wait().map_err(|err| {
+            CliError(format!(
+                "failed to poll isolated probe process {}: {err}",
+                child.id()
+            ))
+        })? {
             return Ok(Some(status));
         }
         if Instant::now() >= deadline {
-            // Best-effort: the process may have exited between the last
-            // try_wait and here, in which case kill() harmlessly errors
-            // (already-exited processes can't be killed) — ignored, since
-            // either way the outcome from here on is "timed out".
-            let _ = child.kill();
-            let _ = child.wait();
+            // A child can exit between polling and kill. In that race,
+            // try_wait reaps it; otherwise report the failed termination.
+            match child.kill() {
+                Ok(()) => {
+                    child.wait().map_err(|err| {
+                        CliError(format!(
+                            "failed to reap timed-out probe process {}: {err}",
+                            child.id()
+                        ))
+                    })?;
+                }
+                Err(kill_err) => match child.try_wait() {
+                    Ok(Some(_)) => {} // Already exited and reaped.
+                    Ok(None) => {
+                        return Err(CliError(format!(
+                            "failed to terminate timed-out probe process {}: {kill_err}",
+                            child.id()
+                        )));
+                    }
+                    Err(poll_err) => {
+                        return Err(CliError(format!(
+                            "failed to terminate or poll timed-out probe process {}: \
+                             kill: {kill_err}; poll: {poll_err}",
+                            child.id()
+                        )));
+                    }
+                },
+            }
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -1070,8 +1313,18 @@ fn load(
     function: &str,
     ramp: &str,
 ) -> Result<(Address, Env, ScSpecFunctionV0, usize), CliError> {
-    let wasm = std::fs::read(contract)
-        .map_err(|err| CliError(format!("failed to read {}: {err}", contract.display())))?;
+    let wasm = std::fs::read(contract).map_err(|err| {
+        let guidance = if err.kind() == std::io::ErrorKind::NotFound {
+            "contract file not found; check --contract (relative paths use the current directory) \
+             and build the contract successfully before retrying"
+        } else {
+            "check that --contract points to a readable .wasm file"
+        };
+        CliError(format!(
+            "failed to read {}: {err}; {guidance}",
+            contract.display()
+        ))
+    })?;
 
     let entries = soroban_spec::read::from_wasm(&wasm)
         .map_err(|err| CliError(format!("failed to read contract spec: {err}")))?;
@@ -1125,10 +1378,20 @@ fn load(
                 .iter()
                 .map(|p| p.name.to_utf8_string_lossy().to_string())
                 .collect();
+            let (available, guidance) = if param_names.is_empty() {
+                (
+                    "(none)".to_string(),
+                    "choose a function with a numeric, Bytes, or Vec parameter using --fn",
+                )
+            } else {
+                (
+                    param_names.join(", "),
+                    "set --ramp to an input name from the selected function's contract ABI",
+                )
+            };
             CliError(format!(
                 "{function:?} has no parameter named {ramp:?}; \
-                 available parameters: {}",
-                param_names.join(", ")
+                 available parameters: {available}; {guidance}"
             ))
         })?;
 
@@ -1229,7 +1492,15 @@ fn explicit_val(env: &Env, type_: &ScSpecTypeDef, value: &str) -> Result<Val, Cl
                 .strip_prefix("0x")
                 .ok_or_else(|| CliError("Bytes --arg values must start with 0x".to_string()))?;
             let bytes = decode_hex(hex)?;
-            Ok(soroban_sdk::Bytes::from_slice(env, &bytes).into_val(env))
+            // An empty override (0x with no digits) must produce the same
+            // empty `Bytes` that `default_val` and `vec_element_val` use
+            // (`Bytes::new`), not `Bytes::from_slice(&[])`, which serializes
+            // to invalid XDR for the zero-length case.
+            if bytes.is_empty() {
+                Ok(soroban_sdk::Bytes::new(env).into_val(env))
+            } else {
+                Ok(soroban_sdk::Bytes::from_slice(env, &bytes).into_val(env))
+            }
         }
         ScSpecTypeDef::Address => {
             let strkey = value
@@ -1488,6 +1759,69 @@ mod tests {
     }
 
     #[test]
+    fn ramp_steps_stop_at_the_cap_without_overflow() {
+        assert_eq!(next_ramp_value(1, SEARCH_UPPER_BOUND), Some(2));
+        assert_eq!(
+            next_ramp_value(SEARCH_UPPER_BOUND / 2, SEARCH_UPPER_BOUND),
+            Some(SEARCH_UPPER_BOUND)
+        );
+        assert_eq!(
+            next_ramp_value(SEARCH_UPPER_BOUND, SEARCH_UPPER_BOUND),
+            None
+        );
+        assert_eq!(next_ramp_value(8, 13), Some(13));
+        assert_eq!(next_ramp_value(u32::MAX / 2 + 1, u32::MAX), Some(u32::MAX));
+        assert_eq!(next_ramp_value(u32::MAX, u32::MAX), None);
+        assert_eq!(next_ramp_value(u32::MAX, SEARCH_UPPER_BOUND), None);
+    }
+
+    #[test]
+    fn refinement_rejects_changed_endpoints_before_probing_interior() {
+        for (lower_succeeds, upper_succeeds, expected, calls) in [
+            (false, false, "lower bound 8 no longer succeeds", vec![8]),
+            (true, true, "upper bound 32 now succeeds", vec![8, 32]),
+            (false, true, "lower bound 8 no longer succeeds", vec![8]),
+        ] {
+            let mut probed = Vec::new();
+            let err = refine_upper_bound(8, 32, &mut |value| {
+                probed.push(value);
+                Ok(if value == 8 {
+                    lower_succeeds
+                } else {
+                    upper_succeeds
+                })
+            })
+            .unwrap_err();
+            assert!(err.0.contains("non-monotonic probe results"), "{}", err.0);
+            assert!(err.0.contains(expected), "{}", err.0);
+            assert_eq!(probed, calls);
+        }
+    }
+
+    #[test]
+    fn refinement_validates_adjacent_bounds_and_handles_u32_max() {
+        let (low, high, audit) = refine_upper_bound_audited(u32::MAX - 1, u32::MAX, &mut |value| {
+            Ok(if value < u32::MAX {
+                ProbeOutcome::Succeeded
+            } else {
+                ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure)
+            })
+        })
+        .unwrap();
+        assert_eq!((low, high), (u32::MAX - 1, u32::MAX));
+        assert!(audit.steps.is_empty());
+        let result = refine_upper_bound(1, u32::MAX, &mut |v| Ok(v < u32::MAX)).unwrap();
+        assert_eq!(result, (u32::MAX - 1, u32::MAX));
+    }
+
+    #[test]
+    fn refinement_preserves_probe_errors() {
+        let err = refine_upper_bound(1, 4, &mut |_| Err(CliError("cannot spawn probe".into())))
+            .unwrap_err();
+        assert_eq!(err.0, "cannot spawn probe");
+    }
+
+    #[test]
     fn binary_search_refines_to_adjacent_success_and_failure() {
         let mut probed = Vec::new();
         let (success, failure) = refine_upper_bound(8, 32, &mut |value| {
@@ -1496,7 +1830,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!((success, failure), (19, 20));
-        assert!(probed.len() <= 5);
+        assert_eq!(&probed[..2], &[8, 32]);
+        assert!(probed.len() <= 7);
     }
 
     // ---- #245: baseline comparison ----
@@ -1523,6 +1858,7 @@ mod tests {
             memory_bytes: 50_000,
             first_failed: Some(101),
             first_failure_category: Some(ProbeFailureCategory::ExitFailure),
+            first_failed_probe_stderr: None,
             probe_failure_counts: BTreeMap::from([(ProbeFailureCategory::ExitFailure, 1)]),
             hit_upper_bound: false,
             probe_timeout_secs: 30,
@@ -1720,6 +2056,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shell_quote_protects_paths_with_spaces_and_single_quotes() {
+        assert_eq!(shell_quote("vault.wasm"), "vault.wasm");
+        assert_eq!(shell_quote("my dir/vault.wasm"), "'my dir/vault.wasm'");
+        assert_eq!(shell_quote("can't run.wasm"), "'can'\\''t run.wasm'");
+        assert_eq!(shell_quote("$(touch bad)"), "'$(touch bad)'");
+        let guide = build_reproduction_guidance(
+            "my dir/can't run.wasm",
+            "batch_payout",
+            "recipients",
+            3,
+            &["memo=hello world".into()],
+        );
+        assert!(guide.contains("--contract 'my dir/can'\\''t run.wasm'"));
+        assert!(guide.contains("--arg 'memo=hello world'"));
+    }
+
+    #[test]
+    fn completed_probe_retains_actual_nonzero_exit_status() {
+        let mut child = Command::new("sh").args(["-c", "exit 17"]).spawn().unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(17));
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(17));
+    }
+
+    #[test]
+    fn timed_out_probe_is_killed_and_reaped() {
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        assert!(wait_with_timeout(&mut child, Duration::from_millis(40))
+            .unwrap()
+            .is_none());
+        assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+    }
+
+    #[test]
+    fn abandoned_probe_guard_prevents_late_artifacts() {
+        let root = std::env::temp_dir().join(format!("stk-interrupted-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("late-artifact");
+        let child = Command::new("sh")
+            .args(["-c", "sleep 1; touch \"$1\"", "_"])
+            .arg(&marker)
+            .current_dir(&root)
+            .spawn()
+            .unwrap();
+        {
+            // Simulates an early return/error: the guard kills the child.
+            let _probe = ProbeChild { child };
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(!marker.exists(), "an abandoned probe wrote after Drop");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn oversized_timeout_is_actionable_and_guard_still_reaps() {
+        let child = Command::new("sleep").arg("10").spawn().unwrap();
+        let mut guard = ProbeChild { child };
+        let err = wait_with_timeout(&mut guard.child, Duration::MAX).unwrap_err();
+        assert!(err.0.contains("too large for the host clock"), "{}", err.0);
+        drop(guard);
+    }
+
     // ---- #244: export results ----
 
     #[test]
@@ -1873,6 +2275,7 @@ mod tests {
             function: "test".to_string(),
             ramp: "count".to_string(),
             probe_timeout: 30,
+            jobs: 1,
             baseline: None,
             baseline_tolerance_pct: 5.0,
             save_baseline: None,
@@ -1888,6 +2291,49 @@ mod tests {
             "expected file error, got: {}",
             err_msg
         );
+    }
+
+    // ---- #192: opt-in bounded parallel probing ----
+
+    fn args_with_jobs(jobs: usize) -> LimitsArgs {
+        LimitsArgs {
+            contract: std::path::PathBuf::from("nonexistent.wasm"),
+            function: "test".to_string(),
+            ramp: "count".to_string(),
+            probe_timeout: 30,
+            jobs,
+            baseline: None,
+            baseline_tolerance_pct: 5.0,
+            save_baseline: None,
+            export: None,
+            arg_values: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn jobs_outside_one_to_eight_is_rejected_before_loading_the_contract() {
+        for jobs in [0, MAX_PROBE_JOBS + 1] {
+            let err = run(args_with_jobs(jobs)).unwrap_err().0;
+            assert_eq!(err, format!("--jobs must be between 1 and 8 (got {jobs})"));
+        }
+    }
+
+    #[test]
+    fn ladder_batch_takes_consecutive_ladder_values_up_to_jobs() {
+        assert_eq!(ladder_batch(1, SEARCH_UPPER_BOUND, 1), vec![1]);
+        assert_eq!(ladder_batch(1, SEARCH_UPPER_BOUND, 3), vec![1, 2, 4]);
+        assert_eq!(ladder_batch(4, SEARCH_UPPER_BOUND, 2), vec![4, 8]);
+    }
+
+    #[test]
+    fn ladder_batch_stops_at_the_upper_bound() {
+        assert_eq!(ladder_batch(4, 8, 8), vec![4, 8]);
+        assert_eq!(ladder_batch(8, 8, 4), vec![8]);
+    }
+
+    #[test]
+    fn ladder_batch_is_never_empty_even_for_zero_jobs() {
+        assert_eq!(ladder_batch(2, SEARCH_UPPER_BOUND, 0), vec![2]);
     }
 
     // ---- #493: numeric ramp boundary refinement audit ----
@@ -1910,12 +2356,13 @@ mod tests {
         assert_eq!(audit.initial_high, 30);
         assert_eq!(audit.final_success, 23);
         assert_eq!(audit.final_failure, 24);
-        assert_eq!(audit.steps.len(), probed.len());
+        assert_eq!(&probed[..2], &[10, 30]);
+        assert_eq!(audit.steps.len(), probed.len() - 2);
 
         for (i, step) in audit.steps.iter().enumerate() {
             assert_eq!(step.step, i + 1);
-            assert_eq!(step.probe_value, probed[i]);
-            assert_eq!(step.succeeded, probed[i] <= 23);
+            assert_eq!(step.probe_value, probed[i + 2]);
+            assert_eq!(step.succeeded, step.probe_value <= 23);
             // Every failing step carries the standardized category; every
             // succeeding step carries none.
             assert_eq!(
@@ -1923,6 +2370,29 @@ mod tests {
                 (!step.succeeded).then_some(ProbeFailureCategory::ExitFailure)
             );
         }
+    }
+
+    // ---- #444: contract failures must not be treated as budget ceilings ----
+    #[test]
+    fn probe_exit_classifier_distinguishes_contract_errors_from_unknown_exits() {
+        assert_eq!(
+            classify_probe_exit_stderr(
+                "error: contract-failure: invocation returned Error(Contract, #1)\n"
+            ),
+            ProbeFailureCategory::ContractFailure
+        );
+        assert_eq!(
+            classify_probe_exit_stderr("error: probe failed\n"),
+            ProbeFailureCategory::ExitFailure
+        );
+        assert_eq!(
+            classify_probe_exit_stderr(""),
+            ProbeFailureCategory::ExitFailure
+        );
+        assert_eq!(
+            serde_json::to_value(ProbeFailureCategory::ContractFailure).unwrap(),
+            serde_json::json!("contract-failure")
+        );
     }
 
     // ---- #492: standardized probe failure categories ----
@@ -2169,6 +2639,7 @@ mod tests {
             memory_bytes: 25_000,
             first_failed: Some(16),
             first_failure_category: Some(ProbeFailureCategory::ExitFailure),
+            first_failed_probe_stderr: None,
             probe_failure_counts: BTreeMap::from([(ProbeFailureCategory::ExitFailure, 1)]),
             audit: Some(audit),
             ..sample_summary()
@@ -2200,6 +2671,7 @@ mod tests {
             memory_bytes: 25_000,
             first_failed: Some(16),
             first_failure_category: Some(ProbeFailureCategory::TimedOut),
+            first_failed_probe_stderr: None,
             probe_failure_counts: BTreeMap::from([
                 (ProbeFailureCategory::ExitFailure, 2),
                 (ProbeFailureCategory::TimedOut, 1),
@@ -2293,5 +2765,173 @@ mod tests {
             parsed.measurement_limitations.as_deref(),
             Some(MEASUREMENT_LIMITATIONS)
         );
+    }
+
+    // ---- Bug: handle empty Bytes overrides without producing invalid XDR ----
+
+    #[test]
+    fn explicit_val_empty_bytes_override_produces_valid_empty_bytes() {
+        let env = Env::default();
+        // 0x with no hex digits — the regression input. Must produce the
+        // same empty Bytes that `Bytes::new` does, not invalid XDR.
+        let val = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x").unwrap();
+        let bytes: soroban_sdk::Bytes = val.into_val(&env);
+        assert_eq!(bytes.len(), 0);
+    }
+
+    #[test]
+    fn explicit_val_nonempty_bytes_override_still_works() {
+        let env = Env::default();
+        let val = explicit_val(&env, &ScSpecTypeDef::Bytes, "0xdeadbeef").unwrap();
+        let bytes: soroban_sdk::Bytes = val.into_val(&env);
+        assert_eq!(bytes.len(), 4);
+    }
+
+    #[test]
+    fn explicit_val_single_byte_bytes_override() {
+        // Edge case: a one-byte (two hex digit) value.
+        let env = Env::default();
+        let val = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x00").unwrap();
+        let bytes: soroban_sdk::Bytes = val.into_val(&env);
+        assert_eq!(bytes.len(), 1);
+    }
+
+    #[test]
+    fn explicit_val_bytes_override_rejects_missing_prefix() {
+        let env = Env::default();
+        let err = explicit_val(&env, &ScSpecTypeDef::Bytes, "deadbeef").unwrap_err();
+        assert!(err.0.contains("must start with 0x"), "{}", err.0);
+    }
+
+    #[test]
+    fn explicit_val_empty_bytes_matches_default_val() {
+        // The empty override should produce the same empty Bytes that the
+        // default path (which uses `Bytes::new`) produces.
+        let env = Env::default();
+        let override_val: soroban_sdk::Bytes = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x")
+            .unwrap()
+            .into_val(&env);
+        let default_val: soroban_sdk::Bytes = soroban_sdk::Bytes::new(&env).into_val(&env);
+        assert_eq!(default_val.len(), 0);
+        assert_eq!(override_val.len(), 0);
+    }
+
+    // ---- Bug: retain stderr context from a failed wasm probe ----
+
+    #[test]
+    fn limits_summary_renders_first_failed_probe_stderr() {
+        let summary = LimitsSummary {
+            first_failed: Some(10),
+            first_failure_category: Some(ProbeFailureCategory::ExitFailure),
+            first_failed_probe_stderr: Some("contract panicked: overflow".to_string()),
+            ..sample_summary()
+        };
+        let text = summary.render_text();
+        assert!(
+            text.contains("first failing probe stderr: contract panicked: overflow"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn limits_summary_omits_stderr_line_when_empty() {
+        let summary = LimitsSummary {
+            first_failed_probe_stderr: Some("   \n  ".to_string()),
+            ..sample_summary()
+        };
+        let text = summary.render_text();
+        assert!(
+            !text.contains("first failing probe stderr"),
+            "whitespace-only stderr should not render: {text}"
+        );
+    }
+
+    #[test]
+    fn limits_summary_omits_stderr_line_when_none() {
+        let summary = LimitsSummary {
+            first_failed_probe_stderr: None,
+            ..sample_summary()
+        };
+        let text = summary.render_text();
+        assert!(!text.contains("first failing probe stderr"), "{text}");
+    }
+
+    #[test]
+    fn limits_summary_includes_failed_probe_stderr_in_json() {
+        let summary = LimitsSummary {
+            first_failed_probe_stderr: Some("host abort".to_string()),
+            ..sample_summary()
+        };
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["first_failed_probe_stderr"], "host abort");
+    }
+
+    #[test]
+    fn limits_summary_omits_stderr_from_json_when_none() {
+        let summary = LimitsSummary {
+            first_failed_probe_stderr: None,
+            ..sample_summary()
+        };
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert!(
+            json.get("first_failed_probe_stderr").is_none()
+                || json["first_failed_probe_stderr"].is_null(),
+            "stderr should be skipped when None: {json}"
+        );
+    }
+
+    // ---- Issue #233: paths with spaces ----
+
+    #[test]
+    fn sanitize_report_path_preserves_spaces_in_relative_paths() {
+        let path = Path::new("path/to/my contract.wasm");
+        let sanitized = sanitize_report_path(path);
+        assert_eq!(sanitized, "path/to/my contract.wasm");
+    }
+
+    #[test]
+    fn export_results_handles_path_with_spaces_json() {
+        let dir = std::env::temp_dir().join(format!("stk-limits-spaces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let export_path = dir.join("my results.json");
+
+        let summary = sample_summary();
+        let result = export_results(&export_path, &summary);
+        assert!(
+            result.is_ok(),
+            "should handle spaces in export path: {:?}",
+            result.err()
+        );
+        assert!(
+            export_path.exists(),
+            "export should create file at path with spaces"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn baseline_write_handles_path_with_spaces() {
+        let dir = std::env::temp_dir().join(format!("stk-baseline-spaces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let baseline_path = dir.join("my baseline file.baseline");
+
+        let result = write_baseline(
+            &baseline_path,
+            Path::new("contract.wasm"),
+            "recipients",
+            "batch_payout",
+            100,
+            1_000_000,
+            50_000,
+        );
+        assert!(
+            result.is_ok(),
+            "should handle spaces in baseline path: {:?}",
+            result.err()
+        );
+        assert!(baseline_path.exists(), "baseline should be created");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
