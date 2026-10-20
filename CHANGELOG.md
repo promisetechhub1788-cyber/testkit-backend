@@ -30,6 +30,9 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- Coverage accepts repeatable `--include`/`--package` and `--exclude` flags
+  to select workspace packages for targeted runs.
+
 - Core test environment: `TestEnv` with deterministic seeding
   (`with_seed`), random address generation, and a `TestkitError` type that
   every assertion helper panics with.

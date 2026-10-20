@@ -428,6 +428,14 @@ fn multiple_exclude_flags_are_accepted() {
     assert!(output.status.success());
 }
 
+#[test]
+fn package_alias_selects_workspace_packages() {
+    let output = run(&["coverage", "--package", "cli", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--include <PACKAGE>"), "{stdout}");
+}
+
 /// Combining --include and --exclude is still rejected even alongside other flags.
 #[test]
 fn include_and_exclude_still_rejected_with_other_flags() {

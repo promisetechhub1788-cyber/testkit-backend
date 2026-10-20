@@ -111,7 +111,7 @@ pub struct CoverageArgs {
     ///
     /// If no source files in the selected package are instrumented, coverage
     /// collection will report that no source files were covered.
-    #[arg(long, value_name = "PACKAGE")]
+    #[arg(long, visible_alias = "package", value_name = "PACKAGE")]
     include: Vec<String>,
     /// Collect coverage for the whole workspace except this package.
     /// Repeatable. Mutually exclusive with `--include`.
